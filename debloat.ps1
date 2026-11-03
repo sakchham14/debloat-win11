@@ -62,8 +62,21 @@ function Set-RegistryValue {
             }
         }
         if (-not $WhatIf) {
-            reg add $Path /v $Name /t $Type /d $Value /f | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "reg.exe returned exit code $LASTEXITCODE" }
+            $regType = switch ($Type) {
+                "REG_DWORD" { "DWord" }
+                "REG_SZ"    { "String" }
+                "REG_EXPAND_SZ" { "ExpandString" }
+                "REG_MULTI_SZ"  { "MultiString" }
+                "REG_QWORD"     { "QWord" }
+                "REG_BINARY"    { "Binary" }
+                default     { $Type }
+            }
+            if ($regType -eq "Binary") {
+                $binBytes = [byte[]]($Value -split '(\w{2})' | Where-Object { $_ } | ForEach-Object { [Convert]::ToByte($_,16) })
+                New-ItemProperty -Path $Path -Name $Name -PropertyType $regType -Value $binBytes -Force -ErrorAction Stop | Out-Null
+            } else {
+                New-ItemProperty -Path $Path -Name $Name -PropertyType $regType -Value $Value -Force -ErrorAction Stop | Out-Null
+            }
         } else {
             Write-Host "     [WhatIf] Would set $Path\$Name = $Value" -ForegroundColor DarkGray
         }
@@ -111,8 +124,8 @@ if ($isVmware) {
             Write-Host "     VMware Tools service restarted." -ForegroundColor Green
         }
         if (-not $WhatIf) {
-            reg add "HKLM\SOFTWARE\VMware, Inc.\VMware Tools" /v "EnableCopyPaste" /t REG_DWORD /d 1 /f | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "reg.exe returned exit code $LASTEXITCODE" }
+            New-Item -Path "HKLM:\SOFTWARE\VMware, Inc.\VMware Tools" -Force -ErrorAction SilentlyContinue | Out-Null
+            New-ItemProperty -Path "HKLM:\SOFTWARE\VMware, Inc.\VMware Tools" -Name "EnableCopyPaste" -PropertyType DWord -Value 1 -Force -ErrorAction Stop | Out-Null
         }
     } catch {
         Write-Warning "VMware clipboard fix failed: $_"
@@ -139,7 +152,7 @@ $appsX64 = @(
     "Microsoft.WindowsAlarms","Microsoft.549981C3F5F10"
 )
 
-$appsARM64 = $appsX64 + @("Microsoft.Bard","Microsoft.CloudClip")
+$appsARM64 = $appsX64 + @("Microsoft.CloudClip")
 
 $editionSpecificApps = @()
 switch ($WindowsEdition) {
@@ -151,8 +164,11 @@ switch ($WindowsEdition) {
     default      { $editionSpecificApps = @() }
 }
 
-$allX64Apps  = if ($WindowsEdition -eq 'Enterprise') { $appsX64 } else { $appsX64 + $editionSpecificApps }
-$allARM64Apps = if ($WindowsEdition -eq 'Enterprise') { $appsARM64 } else { $appsARM64 + $editionSpecificApps }
+$appsX64 = $appsX64 | Select-Object -Unique
+$appsARM64 = $appsARM64 | Select-Object -Unique
+$editionSpecificApps = $editionSpecificApps | Select-Object -Unique
+$allX64Apps  = if ($WindowsEdition -eq 'Enterprise') { $appsX64 } else { $appsX64 + $editionSpecificApps } | Select-Object -Unique
+$allARM64Apps = if ($WindowsEdition -eq 'Enterprise') { $appsARM64 } else { $appsARM64 + $editionSpecificApps } | Select-Object -Unique
 
 # ── ASK USER WHICH APPS TO REMOVE ───────────────────────────
 Write-Host "" -ForegroundColor Yellow
@@ -164,25 +180,44 @@ Write-Host "   • Microsoft Edge" -ForegroundColor Gray
 Write-Host "   • Microsoft Copilot" -ForegroundColor Gray
 Write-Host ""
 
-$removeEdge = Read-Host "   Remove Microsoft Edge? (y/n)" -DefaultValue 'n'
-if ($removeEdge -match '[Yy]') {
-    $selectedApps += "Microsoft.Edge"
-    Write-Host "     ✓ Selected: Microsoft Edge" -ForegroundColor Green
+Write-Host "   Keys: y = Yes, n = No, b/Backspace = Back to previous" -ForegroundColor DarkGray
+Write-Host ""
+
+function Read-SingleKey {
+    param([string]$Prompt)
+    Write-Host -NoNewline "   $Prompt "
+    $key = [System.Console]::ReadKey($true)
+    Write-Host $key.KeyChar
+    return $key
 }
 
-$removeCopilot = Read-Host "   Remove Microsoft Copilot? (y/n)" -DefaultValue 'n'
-if ($removeCopilot -match '[Yy]') {
-    $selectedApps += "Microsoft.Copilot"
-    Write-Host "     ✓ Selected: Microsoft Copilot" -ForegroundColor Green
-}
-
+$choices = @()
+$choices += @{ Name = "Microsoft.Edge"; Label = "Microsoft Edge" }
+$choices += @{ Name = "Microsoft.Copilot"; Label = "Microsoft Copilot" }
 $appsToRemove = if ($isARM64) { $allARM64Apps } else { $allX64Apps }
 foreach ($app in $appsToRemove) {
-    $displayName = ($app -replace '^Microsoft\.', 'Microsoft ')
-    $check = Read-Host "   Remove $displayName? (y/n)" -DefaultValue 'n'
-    if ($check -match '[Yy]') {
-        $selectedApps += $app
-        Write-Host "     ✓ Selected: $app" -ForegroundColor Green
+    $choices += @{ Name = $app; Label = ($app -replace '^Microsoft\.', 'Microsoft ') }
+}
+
+$i = 0
+while ($i -lt $choices.Count) {
+    $c = $choices[$i]
+    $key = Read-SingleKey -Prompt "Remove $($c.Label)? (y/n/b)"
+    switch ($key.KeyChar.ToString().ToLower()) {
+        'y' {
+            if ($selectedApps -notcontains $c.Name) { $selectedApps += $c.Name }
+            Write-Host "     Selected: $($c.Name)" -ForegroundColor Green
+            $i++
+        }
+        'n' {
+            $selectedApps = @($selectedApps | Where-Object { $_ -ne $c.Name })
+            $i++
+        }
+        'b' { if ($i -gt 0) { $i-- } }
+        default {
+            if ([int]$key.KeyChar -eq 8) { if ($i -gt 0) { $i-- } }
+            else { Write-Host "     Invalid key. Use y/n/b." -ForegroundColor Yellow }
+        }
     }
 }
 
@@ -278,13 +313,15 @@ if ($WindowsEdition -ne 'Server') {
 
 foreach ($svc in $services) {
     try {
-        $s = Get-Service -Name $svc.Name -ErrorAction Stop
+        $s = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
         if ($s) {
             if (-not $WhatIf) {
-                Stop-Service -Name $svc.Name -Force -ErrorAction Stop
-                Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction Stop
+                try { Stop-Service -Name $svc.Name -Force -ErrorAction Stop } catch { Write-Warning "Could not stop $($svc.Name): $_" }
+                try { Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction Stop } catch { Write-Warning "Could not disable $($svc.Name): $_" }
             }
             Write-Host "     Disabled: $($svc.Desc) ($($svc.Name))" -ForegroundColor Green
+        } else {
+            Write-Host "     Not found: $($svc.Name) - skipping" -ForegroundColor DarkGray
         }
     } catch {
         Write-Warning "Service $($svc.Name) not found or could not be disabled: $_"
@@ -314,7 +351,10 @@ foreach ($k in $perfKeys) {
 }
 
 if (-not $WhatIf) {
-    try { reg add "HKCU\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null } catch { Write-Warning "UserPreferencesMask set failed: $_" }
+    try {
+        $bytes = [byte[]]@(0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00)
+        New-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "UserPreferencesMask" -PropertyType Binary -Value $bytes -Force -ErrorAction Stop | Out-Null
+    } catch { Write-Warning "UserPreferencesMask set failed: $_" }
     try { powercfg /hibernate off | Out-Null } catch { Write-Warning "Hibernate disable failed: $_" }
 }
 
